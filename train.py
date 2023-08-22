@@ -28,7 +28,9 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from tinystories import Task
+from tinystories import Task as tinystoriesTask
+from tinyshakespeare import Task as tinyshakespeareTask
+from lora import LoraArgs, add_lora, get_lora_state_dict
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -48,6 +50,7 @@ batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch 
 max_seq_len = 256
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+dataset = "tinystories" # tinystories|tinyshakespeare
 # model
 dim = 288
 n_layers = 6
@@ -55,6 +58,12 @@ n_heads = 6
 n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
+# lora
+use_lora = False
+lora_rank = 8
+lora_alpha = 16
+lora_dropout_p = 0.05
+lora_target_modules = ['wq', 'wk']
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -128,6 +137,13 @@ ctx = (
 )
 
 # task-specific setup
+if dataset == "tinystories":
+    Task = tinystoriesTask
+elif dataset == "tinyshakespeare":
+    Task = tinyshakespeareTask
+else:
+    raise NotImplementedError
+
 iter_batches = partial(
     Task.iter_batches,
     batch_size=batch_size,
@@ -162,7 +178,7 @@ elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -181,15 +197,46 @@ elif init_from == "resume":
     model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
+elif init_from.startswith("pretrained"):
+    ckpt_path = init_from.split(":")[1]
+    print(f"Load pretrained model from {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint_model_args = checkpoint["model_args"]
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
+        model_args[k] = checkpoint_model_args[k]
+    # init from a pretrained model
+    gptconf = ModelArgs(**model_args)
+    model = Transformer(gptconf)
+    state_dict = checkpoint["model"]
+    unwanted_prefix = "_orig_mod."
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(missing_keys, unexpected_keys)
+
+# lora
+lora_args = dict(
+    rank=lora_rank,
+    alpha=lora_alpha,
+    dropout_p=lora_dropout_p,
+    target_modules=lora_target_modules,
+)
+if use_lora:
+    add_lora(model, LoraArgs(**lora_args))
+
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype in ("float16", "bfloat16")))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == "resume" and "optimizer" in checkpoint:
-    optimizer.load_state_dict(checkpoint["optimizer"])
+if use_lora:
+    optimizer = model.configure_lora_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+else:
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    if init_from == "resume" and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
 # compile the model
@@ -285,6 +332,9 @@ while True:
                     "best_val_loss": best_val_loss,
                     "config": config,
                 }
+                if use_lora:
+                    checkpoint["lora_args"] = lora_args
+                    checkpoint["lora"] = get_lora_state_dict(raw_model)
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
                 raw_model.export(os.path.join(out_dir, "model.bin"))

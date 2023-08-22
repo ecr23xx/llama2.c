@@ -9,6 +9,7 @@ from model import ModelArgs, Transformer
 from tokenizer import Tokenizer
 
 from tinystories import get_tokenizer_model_path
+from lora import LoraArgs, add_lora
 
 # -----------------------------------------------------------------------------
 checkpoint = 'out/ckpt.pt'
@@ -43,7 +44,15 @@ unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-model.load_state_dict(state_dict, strict=False)
+
+if "lora_args" in checkpoint_dict:
+    lora_args = checkpoint_dict["lora_args"]
+    if isinstance(lora_args, LoraArgs):
+        add_lora(model, lora_args)
+    else:
+        add_lora(model, LoraArgs(**lora_args))
+
+model.load_state_dict(state_dict)
 
 model.eval()
 model.to(device)

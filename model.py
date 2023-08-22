@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from lora import get_lora_params, merge_lora
 
 @dataclass
 class ModelArgs:
@@ -289,6 +290,23 @@ class Transformer(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
+        return optimizer
+
+    def configure_lora_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # only lora params requries grad
+        for param in self.parameters():
+            param.requires_grad = False                
+        lora_params = [p for p in get_lora_params(self)]
+        for p in lora_params:
+            p.requires_grad = True
+        optim_groups = [{'params': lora_params, 'weight_decay': weight_decay}]
+        num_lora_params = sum(p.numel() for p in lora_params)
+        print(f"num lora parameter tensors: {len(lora_params)}, with {num_lora_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
