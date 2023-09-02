@@ -10,7 +10,6 @@ from tokenizer import Tokenizer
 DATA_CACHE_DIR = "data"
 
 def pretokenize(vocab_source, vocab_size):
-    assert vocab_source == "custom", "do not support llama2"
     # read text file and pretokenize it
     data_dir = os.path.join(DATA_CACHE_DIR, "tinyshakespeare")
     with open(os.path.join(data_dir, "input.txt")) as f:
@@ -86,6 +85,7 @@ if __name__ == "__main__":
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
+    parser.add_argument("--vocab_source", type=str, default="llama2", choices=["llama2", "custom"])
     parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
     args = parser.parse_args()
 
@@ -95,6 +95,6 @@ if __name__ == "__main__":
     # elif args.stage == "train_vocab":
     #     train_vocab(vocab_size=args.vocab_size)
     if args.stage == "pretokenize":
-        pretokenize("custom", vocab_size=args.vocab_size)
+        pretokenize(vocab_source=args.vocab_source, vocab_size=args.vocab_size)
     else:
         raise ValueError(f"Unknown stage {args.stage}")

@@ -204,7 +204,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
 
-    def __init__(self, params: ModelArgs):
+    def __init__(self, params: ModelArgs, init_weights=False):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -226,12 +226,13 @@ class Transformer(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+        if init_weights:
+            # init all weights
+            self.apply(self._init_weights)
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            for pn, p in self.named_parameters():
+                if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None

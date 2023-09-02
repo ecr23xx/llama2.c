@@ -61,14 +61,14 @@ def add_lora(model, args: LoraArgs):
         if name.split(".")[-1] not in args.target_modules:
             continue
         elif isinstance(layer, nn.Linear):
-            print("add lora to", name)
+            # print("add lora to", name)
             out_features, in_features = layer.weight.shape
             P.register_parametrization(
                 layer, "weight",
                 LoRA(in_features, out_features, "linear", args),
             )
         elif isinstance(layer, nn.Embedding):
-            print("add lora to", name)
+            # print("add lora to", name)
             in_features, out_features = layer.weight.shape
             P.register_parametrization(
                 layer, "weight",

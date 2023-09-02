@@ -9,7 +9,9 @@ from model import ModelArgs, Transformer
 from tokenizer import Tokenizer
 
 from tinystories import get_tokenizer_model_path
-from lora import LoraArgs, add_lora
+from lora import LoraArgs, add_lora, remove_lora
+import torch.autograd.profiler as profiler
+import torch.nn.utils.parametrize as P
 
 # -----------------------------------------------------------------------------
 checkpoint = 'out/ckpt.pt'
@@ -21,8 +23,8 @@ top_k = 300 # retain only the top_k most likely tokens, clamp others to have 0 p
 tokenizer = "" # override the tokenizer model path
 seed = 1337
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-#dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-dtype = "float32"
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+# dtype = "float32"
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
@@ -36,7 +38,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # init from a model saved in a specific directory
-checkpoint_dict = torch.load(checkpoint, map_location=device)
+checkpoint_dict = torch.load(checkpoint, map_location="cpu")
 gptconf = ModelArgs(**checkpoint_dict['model_args'])
 model = Transformer(gptconf)
 state_dict = checkpoint_dict['model']
@@ -47,12 +49,12 @@ for k,v in list(state_dict.items()):
 
 if "lora_args" in checkpoint_dict:
     lora_args = checkpoint_dict["lora_args"]
-    if isinstance(lora_args, LoraArgs):
-        add_lora(model, lora_args)
-    else:
-        add_lora(model, LoraArgs(**lora_args))
+    add_lora(model, LoraArgs(**lora_args))
 
 model.load_state_dict(state_dict)
+
+if "lora_args" in checkpoint_dict:
+    model.bfloat16()
 
 model.eval()
 model.to(device)
@@ -80,7 +82,7 @@ start_ids = enc.encode(start, bos=True, eos=False)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
-with torch.no_grad():
+with torch.no_grad(), P.cached():
     with ctx:
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)

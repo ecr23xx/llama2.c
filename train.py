@@ -1,4 +1,5 @@
 """
+
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
@@ -19,6 +20,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import math
 import os
 import time
+import json
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
@@ -31,6 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tinystories import Task as tinystoriesTask
 from tinyshakespeare import Task as tinyshakespeareTask
 from lora import LoraArgs, add_lora, get_lora_state_dict
+import torch.nn.utils.parametrize as P
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -63,7 +66,7 @@ use_lora = False
 lora_rank = 8
 lora_alpha = 16
 lora_dropout_p = 0.05
-lora_target_modules = ['wq', 'wk']
+lora_target_modules = ['wq', 'wv']
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -77,7 +80,7 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+dtype = "bfloat16-mixed"  # float32|bfloat16-mixed|float16-true|bfloat16-true
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -125,15 +128,16 @@ if master_process:
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
+torch.backends.cuda.enable_flash_sdp(False)  # https://github.com/Lightning-AI/lit-llama/issues/101
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
-ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
+ptdtype = {"float32": torch.float32, "bfloat16-mixed": torch.bfloat16, "bfloat16-true": torch.bfloat16, "float16-true": torch.float16}[dtype]
 ctx = (
-    nullcontext()
-    if device_type == "cpu"
-    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    if device_type == "cuda" and "mixed" in dtype
+    else nullcontext()
 )
 
 # task-specific setup
@@ -173,7 +177,7 @@ if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    model = Transformer(gptconf, init_weights=True)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -188,47 +192,72 @@ elif init_from == "resume":
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
     state_dict = checkpoint["model"]
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    if "lora_args" in checkpoint:
+        lora_args = checkpoint["lora_args"]
+        add_lora(model, LoraArgs(**lora_args))
+        model.load_state_dict(state_dict)
+    else:
+        # fix the keys of the state dictionary :(
+        # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 elif init_from.startswith("pretrained"):
     ckpt_path = init_from.split(":")[1]
     print(f"Load pretrained model from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location="cpu")
-    checkpoint_model_args = checkpoint["model_args"]
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
-        model_args[k] = checkpoint_model_args[k]
+    if "model_args" in checkpoint:
+        checkpoint_model_args = checkpoint["model_args"]
+        # not overriding `max_seq_len` for different dataset needs
+        for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of"]:
+            model_args[k] = checkpoint_model_args[k]
+        state_dict = checkpoint["model"]
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+    else:
+        params_path = os.path.join(os.path.dirname(ckpt_path), "params.json")
+        with open(params_path) as f:
+            checkpoint_model_args = json.load(f)
+            # skip max_seq_len
+            for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of"]:
+                if k in checkpoint_model_args:
+                    model_args[k] = checkpoint_model_args[k]
+            model_args["n_kv_heads"] = model_args["n_heads"]
+            model_args['vocab_size'] = vocab_size
+        state_dict = checkpoint
     # init from a pretrained model
+    # TODO: fast init: https://lernapparat.de/faster-model-init
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
-    state_dict = checkpoint["model"]
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(missing_keys, unexpected_keys)
 
-# lora
-lora_args = dict(
-    rank=lora_rank,
-    alpha=lora_alpha,
-    dropout_p=lora_dropout_p,
-    target_modules=lora_target_modules,
-)
-if use_lora:
-    add_lora(model, LoraArgs(**lora_args))
+    # lora
+    lora_args = dict(
+        rank=lora_rank,
+        alpha=lora_alpha,
+        dropout_p=lora_dropout_p,
+        target_modules=lora_target_modules,
+    )
+    if use_lora:
+        add_lora(model, LoraArgs(**lora_args))
 
+if dtype == "bfloat16-true":
+    print("conver model to bfloat16 precision")
+    model.bfloat16()
+elif dtype == "float16-true":
+    print("conver model to float16 precision")
+    model.half()
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype in ("float16", "bfloat16")))
+scaler = torch.cuda.amp.GradScaler(enabled=("mixed" in dtype))
 
 # optimizer
 if use_lora:
@@ -263,7 +292,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
             X, Y = next(batch_iter)
-            with ctx:
+            with ctx, P.cached():
                 logits = model(X, Y)
                 loss = raw_model.last_loss
             losses[k] = loss.item()
@@ -337,7 +366,8 @@ while True:
                     checkpoint["lora"] = get_lora_state_dict(raw_model)
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                raw_model.export(os.path.join(out_dir, "model.bin"))
+                if not use_lora:
+                    raw_model.export(os.path.join(out_dir, "model.bin"))
     if iter_num == 0 and eval_only:
         break
 
@@ -350,7 +380,7 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
-        with ctx:
+        with ctx, P.cached():
             logits = model(X, Y)
             loss = raw_model.last_loss
             loss = loss / gradient_accumulation_steps
