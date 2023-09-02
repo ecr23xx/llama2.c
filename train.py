@@ -34,6 +34,7 @@ from tinystories import Task as tinystoriesTask
 from tinyshakespeare import Task as tinyshakespeareTask
 from lora import LoraArgs, add_lora, get_lora_state_dict
 import torch.nn.utils.parametrize as P
+from export import model_export
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -346,7 +347,7 @@ while True:
                         "loss/val": losses["val"],
                         "lr": lr,
                         "mfu": running_mfu * 100,  # convert to percentage
-                    }
+                    }, step = iter_num
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
@@ -367,7 +368,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
                 if not use_lora:
-                    raw_model.export(os.path.join(out_dir, "model.bin"))
+                    model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 
