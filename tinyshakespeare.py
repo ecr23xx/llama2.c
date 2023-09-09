@@ -86,7 +86,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
     parser.add_argument("--vocab_source", type=str, default="llama2", choices=["llama2", "custom"])
-    parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
+    parser.add_argument("--vocab_size", type=int, default=32000, help="pretokenization vocab size. 32000 = use Llama 2 tokenizer.")
     args = parser.parse_args()
 
     # depending on the stage call the appropriate function

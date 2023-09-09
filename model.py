@@ -23,6 +23,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    tie_weight: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -222,7 +223,11 @@ class Transformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        # https://paperswithcode.com/method/weight-tying
+        # if using llama as baseline to finetune, do not tie the weight
+        if params.tie_weight:
+            print("tie the weight")
+            self.tok_embeddings.weight = self.output.weight
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
@@ -358,5 +363,6 @@ class Transformer(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+            # print(idx)
 
         return idx

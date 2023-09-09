@@ -32,6 +32,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tinystories import Task as tinystoriesTask
 from tinyshakespeare import Task as tinyshakespeareTask
+from alpaca import Task as alpacaTask
+from tinystories_zh import Task as tinystories_zhTask
 from lora import LoraArgs, add_lora, get_lora_state_dict
 import torch.nn.utils.parametrize as P
 from export import model_export
@@ -62,6 +64,7 @@ n_heads = 6
 n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
+tie_weight = True
 # lora
 use_lora = False
 lora_rank = 8
@@ -146,6 +149,10 @@ if dataset == "tinystories":
     Task = tinystoriesTask
 elif dataset == "tinyshakespeare":
     Task = tinyshakespeareTask
+elif dataset == "alpaca":
+    Task = alpacaTask
+elif dataset == "tinystories_zh":
+    Task = tinystories_zhTask
 else:
     raise NotImplementedError
 
@@ -173,6 +180,7 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    tie_weight=tie_weight,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -187,7 +195,7 @@ elif init_from == "resume":
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len", "tie_weight"]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
@@ -214,7 +222,7 @@ elif init_from.startswith("pretrained"):
     if "model_args" in checkpoint:
         checkpoint_model_args = checkpoint["model_args"]
         # not overriding `max_seq_len` for different dataset needs
-        for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of"]:
+        for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "tie_weight"]:
             model_args[k] = checkpoint_model_args[k]
         state_dict = checkpoint["model"]
         unwanted_prefix = "_orig_mod."
@@ -231,6 +239,7 @@ elif init_from.startswith("pretrained"):
                     model_args[k] = checkpoint_model_args[k]
             model_args["n_kv_heads"] = model_args["n_heads"]
             model_args['vocab_size'] = vocab_size
+            model_args['tie_weight'] = False
         state_dict = checkpoint
     # init from a pretrained model
     # TODO: fast init: https://lernapparat.de/faster-model-init
